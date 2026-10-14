@@ -1,0 +1,25 @@
+diff -ru a7/src/venus/vkr_image.c b7/src/venus/vkr_image.c
+--- a7/src/venus/vkr_image.c	2026-10-13 17:05:37.988490949 -0400
++++ b7/src/venus/vkr_image.c	2026-10-13 17:05:38.027423204 -0400
+@@ -171,12 +171,21 @@
+          sub->aspectMask = VK_IMAGE_ASPECT_PLANE_2_BIT;
+       }
+       vk->GetImageSubresourceLayout(args->device, args->image, sub, args->pLayout);
++      if (!args->pLayout->rowPitch)
++         vkr_log("vkGetImageSubresourceLayout: row pitch 0 for memory plane (aspect 0x%x -> 0x%x)",
++                 aspect, sub->aspectMask);
+       sub->aspectMask = aspect;
+       return;
+    }
+ #endif
+    vk->GetImageSubresourceLayout(args->device, args->image, args->pSubresource,
+                                  args->pLayout);
++#if defined(__TERMUX__)
++   if (!args->pLayout->rowPitch)
++      vkr_log("vkGetImageSubresourceLayout: row pitch 0 (aspect 0x%x mip %u layer %u size %llu)",
++              args->pSubresource->aspectMask, args->pSubresource->mipLevel,
++              args->pSubresource->arrayLayer, (unsigned long long)args->pLayout->size);
++#endif
+ }
+ 
+ static void

@@ -1,0 +1,91 @@
+diff -ru a6/src/venus/vkr_device_memory.c b6/src/venus/vkr_device_memory.c
+--- a6/src/venus/vkr_device_memory.c	2026-10-13 16:43:26.633176226 -0400
++++ b6/src/venus/vkr_device_memory.c	2026-10-13 16:43:41.203282062 -0400
+@@ -522,6 +522,18 @@
+ #endif
+ 
+    struct vkr_device_memory *mem = vkr_device_memory_create_and_add(ctx, args);
++#if defined(__TERMUX__)
++   if (!mem) {
++      const VkMemoryDedicatedAllocateInfo *dedicated = vkr_find_struct(
++         alloc_info->pNext, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
++      vkr_log("vkAllocateMemory failed (%d): size %llu type %u flags 0x%x%s%s%s%s",
++              (int32_t)args->ret, (unsigned long long)alloc_info->allocationSize,
++              mem_type_index, property_flags,
++              dedicated && dedicated->image ? " dedicated-image" : "",
++              dedicated && dedicated->buffer ? " dedicated-buffer" : "",
++              export_info ? " export" : "", res_info ? " import" : "");
++   }
++#endif
+    if (!mem) {
+       if (local_import_info.fd >= 0)
+          close(local_import_info.fd);
+diff -ru a6/src/venus/vkr_image.c b6/src/venus/vkr_image.c
+--- a6/src/venus/vkr_image.c	2026-10-13 16:43:26.633176226 -0400
++++ b6/src/venus/vkr_image.c	2026-10-13 16:43:55.461257616 -0400
+@@ -149,6 +149,32 @@
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
+    vn_replace_vkGetImageSubresourceLayout_args_handle(args);
++#if defined(__TERMUX__)
++   /* Images asked for with DRM-modifier tiling are created linear (vkCreateImage), where a
++    * memory-plane aspect is not valid: the driver answered a row pitch of 0 and compositors
++    * refused the buffer ("invalid stride 0"). Ask with the colour aspect, or the plane's own. */
++   VkImageSubresource *sub = (VkImageSubresource *)args->pSubresource;
++   const VkImageAspectFlags aspect = sub->aspectMask;
++   if (aspect & (VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT | VK_IMAGE_ASPECT_MEMORY_PLANE_1_BIT_EXT |
++                 VK_IMAGE_ASPECT_MEMORY_PLANE_2_BIT_EXT | VK_IMAGE_ASPECT_MEMORY_PLANE_3_BIT_EXT)) {
++      if (aspect & VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT) {
++         sub->aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++         vk->GetImageSubresourceLayout(args->device, args->image, sub, args->pLayout);
++         if (args->pLayout->rowPitch) {
++            sub->aspectMask = aspect;
++            return;
++         }
++         sub->aspectMask = VK_IMAGE_ASPECT_PLANE_0_BIT;
++      } else if (aspect & VK_IMAGE_ASPECT_MEMORY_PLANE_1_BIT_EXT) {
++         sub->aspectMask = VK_IMAGE_ASPECT_PLANE_1_BIT;
++      } else {
++         sub->aspectMask = VK_IMAGE_ASPECT_PLANE_2_BIT;
++      }
++      vk->GetImageSubresourceLayout(args->device, args->image, sub, args->pLayout);
++      sub->aspectMask = aspect;
++      return;
++   }
++#endif
+    vk->GetImageSubresourceLayout(args->device, args->image, args->pSubresource,
+                                  args->pLayout);
+ }
+@@ -162,6 +188,32 @@
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
+    vn_replace_vkGetImageSubresourceLayout2_args_handle(args);
++#if defined(__TERMUX__)
++   /* As vkGetImageSubresourceLayout: memory-plane aspects of a linear image. */
++   VkImageSubresource *sub = &((VkImageSubresource2 *)args->pSubresource)->imageSubresource;
++   const VkImageAspectFlags aspect = sub->aspectMask;
++   if (aspect & VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT) {
++      sub->aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++      vk->GetImageSubresourceLayout2(args->device, args->image, args->pSubresource,
++                                     args->pLayout);
++      if (!args->pLayout->subresourceLayout.rowPitch) {
++         sub->aspectMask = VK_IMAGE_ASPECT_PLANE_0_BIT;
++         vk->GetImageSubresourceLayout2(args->device, args->image, args->pSubresource,
++                                        args->pLayout);
++      }
++      sub->aspectMask = aspect;
++      return;
++   }
++   if (aspect & (VK_IMAGE_ASPECT_MEMORY_PLANE_1_BIT_EXT | VK_IMAGE_ASPECT_MEMORY_PLANE_2_BIT_EXT)) {
++      sub->aspectMask = (aspect & VK_IMAGE_ASPECT_MEMORY_PLANE_1_BIT_EXT)
++                           ? VK_IMAGE_ASPECT_PLANE_1_BIT
++                           : VK_IMAGE_ASPECT_PLANE_2_BIT;
++      vk->GetImageSubresourceLayout2(args->device, args->image, args->pSubresource,
++                                     args->pLayout);
++      sub->aspectMask = aspect;
++      return;
++   }
++#endif
+    vk->GetImageSubresourceLayout2(args->device, args->image, args->pSubresource,
+                                   args->pLayout);
+ }

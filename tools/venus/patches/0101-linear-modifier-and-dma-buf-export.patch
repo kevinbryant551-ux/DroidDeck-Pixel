@@ -1,0 +1,204 @@
+diff -ru a/src/venus/vkr_image.c b/src/venus/vkr_image.c
+--- a/src/venus/vkr_image.c	2026-10-13 11:27:06.346541164 -0400
++++ b/src/venus/vkr_image.c	2026-10-13 11:27:42.916067013 -0400
+@@ -41,6 +41,18 @@
+    }
+    VkImageCreateInfo *image_info = (void *)args->pCreateInfo;
+    image_info->tiling = VK_IMAGE_TILING_LINEAR;
++   /* Linear is the one modifier advertised; its create structs would not be valid with it. */
++   const VkStructureType mod_structs[] = {
++      VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
++      VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
++   };
++   for (unsigned i = 0; i < sizeof(mod_structs) / sizeof(mod_structs[0]); i++) {
++      const VkBaseInStructure *mod = vkr_find_struct(image_info->pNext, mod_structs[i]);
++      if (mod) {
++         VkBaseInStructure *prev = vkr_find_prev_struct(image_info, mod_structs[i]);
++         prev->pNext = mod->pNext;
++      }
++   }
+ #endif
+ 
+    vkr_image_create_and_add(dispatch->data, args);
+diff -ru a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
+--- a/src/venus/vkr_physical_device.c	2026-10-13 11:27:06.346541164 -0400
++++ b/src/venus/vkr_physical_device.c	2026-10-13 11:27:42.915241724 -0400
+@@ -703,6 +703,34 @@
+    }
+ }
+ 
++#if defined(__TERMUX__)
++/* Unlinks the struct of this type from a chain for the driver's call; returns its predecessor so
++ * vkr_relink puts it back where it was. The reply is decoded by walking the guest's chain in its
++ * own order, so a struct put back anywhere else breaks the decode (a NULL dereference in Venus). */
++static VkBaseOutStructure *
++vkr_unlink(void *chain, VkStructureType type, VkBaseOutStructure **out)
++{
++   for (VkBaseOutStructure *prev = chain; prev->pNext; prev = prev->pNext) {
++      if (prev->pNext->sType == type) {
++         *out = prev->pNext;
++         prev->pNext = prev->pNext->pNext;
++         return prev;
++      }
++   }
++   *out = NULL;
++   return NULL;
++}
++
++static void
++vkr_relink(VkBaseOutStructure *prev, VkBaseOutStructure *s)
++{
++   if (prev && s) {
++      s->pNext = prev->pNext;
++      prev->pNext = s;
++   }
++}
++#endif
++
+ static void
+ vkr_dispatch_vkGetPhysicalDeviceFormatProperties2(
+    UNUSED struct vn_dispatch_context *dispatch,
+@@ -713,23 +741,13 @@
+    struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+ 
+ #if defined(__TERMUX__)
+-   VkDrmFormatModifierPropertiesListEXT *mod_list = vkr_find_struct(
+-      args->pFormatProperties, VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT);
+-   if (mod_list) {
+-      VkBaseInStructure *prev_of_mod_list =
+-         vkr_find_prev_struct(args->pFormatProperties,
+-                              VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT);
+-      prev_of_mod_list->pNext = mod_list->pNext;
+-
+-      mod_list->drmFormatModifierCount = 1;
+-
+-      if (mod_list->pDrmFormatModifierProperties) {
+-         mod_list->pDrmFormatModifierProperties[0] = (VkDrmFormatModifierPropertiesEXT){
+-            .drmFormatModifier = 0 /* DRM_FORMAT_MOD_LINEAR */,
+-            .drmFormatModifierPlaneCount = 1,
+-         };
+-      }
+-   }
++   /* Every image is created linear (vkCreateImage), so linear is the one modifier there is: the
++    * driver's own list is not asked for, and the answer is filled in here. */
++   VkBaseOutStructure *list, *list2;
++   VkBaseOutStructure *prev = vkr_unlink(args->pFormatProperties,
++      VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT, &list);
++   VkBaseOutStructure *prev2 = vkr_unlink(args->pFormatProperties,
++      VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT, &list2);
+ #endif
+ 
+    vn_replace_vkGetPhysicalDeviceFormatProperties2_args_handle(args);
+@@ -737,10 +755,34 @@
+                                           args->pFormatProperties);
+ 
+ #if defined(__TERMUX__)
+-   if (mod_list) {
+-      mod_list->pNext = args->pFormatProperties->pNext;
+-      args->pFormatProperties->pNext = mod_list;
++   /* What linear tiling can do is what the modifier can; with no features a compositor drops it
++    * and finds no format to share. */
++   const VkFormatFeatureFlags linear =
++      args->pFormatProperties->formatProperties.linearTilingFeatures;
++   if (list) {
++      VkDrmFormatModifierPropertiesListEXT *l = (void *)list;
++      if (l->pDrmFormatModifierProperties && l->drmFormatModifierCount) {
++         l->pDrmFormatModifierProperties[0] = (VkDrmFormatModifierPropertiesEXT){
++            .drmFormatModifier = 0 /* DRM_FORMAT_MOD_LINEAR */,
++            .drmFormatModifierPlaneCount = 1,
++            .drmFormatModifierTilingFeatures = linear,
++         };
++      }
++      l->drmFormatModifierCount = linear ? 1 : 0;
++   }
++   if (list2) {
++      VkDrmFormatModifierPropertiesList2EXT *l = (void *)list2;
++      if (l->pDrmFormatModifierProperties && l->drmFormatModifierCount) {
++         l->pDrmFormatModifierProperties[0] = (VkDrmFormatModifierProperties2EXT){
++            .drmFormatModifier = 0 /* DRM_FORMAT_MOD_LINEAR */,
++            .drmFormatModifierPlaneCount = 1,
++            .drmFormatModifierTilingFeatures = linear,
++         };
++      }
++      l->drmFormatModifierCount = linear ? 1 : 0;
+    }
++   vkr_relink(prev2, list2);
++   vkr_relink(prev, list);
+ #endif
+ }
+ 
+@@ -754,20 +796,46 @@
+    struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+ 
+ #if defined(__TERMUX__)
+-   VkPhysicalDeviceImageDrmFormatModifierInfoEXT *mod_info = vkr_find_struct(
+-      args->pImageFormatInfo->pNext,
+-      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT);
+-   if (mod_info) {
+-      VkBaseInStructure *prev_of_mod_info = vkr_find_prev_struct(
+-         args->pImageFormatInfo,
+-         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT);
+-      prev_of_mod_info->pNext = mod_info->pNext;
+-   }
++   VkPhysicalDeviceImageFormatInfo2 *info = (void *)args->pImageFormatInfo;
++   /* Linear is the one modifier: ask about linear tiling, without the modifier's info. */
++   VkBaseOutStructure *mod_info;
++   VkBaseOutStructure *prev_mod = vkr_unlink(info,
++      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT, &mod_info);
++   const VkImageTiling tiling = info->tiling;
++   if (tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
++      info->tiling = VK_IMAGE_TILING_LINEAR;
++   /* dma-buf memory here is an AHardwareBuffer's (vkAllocateMemory), which the driver imports;
++    * asked about dma-buf it would say import-only, and the guest would never share an image. Ask
++    * the plain question and answer for the AHardwareBuffer path. */
++   VkBaseOutStructure *ext_info = NULL, *prev_ext = NULL;
++   const VkPhysicalDeviceExternalImageFormatInfo *ext = vkr_find_struct(
++      info->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
++   if (ext && ext->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
++      prev_ext = vkr_unlink(info, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
++                            &ext_info);
+ #endif
+ 
+    vn_replace_vkGetPhysicalDeviceImageFormatProperties2_args_handle(args);
+    args->ret = vk->GetPhysicalDeviceImageFormatProperties2(
+       args->physicalDevice, args->pImageFormatInfo, args->pImageFormatProperties);
++
++#if defined(__TERMUX__)
++   if (ext_info && args->ret == VK_SUCCESS) {
++      VkExternalImageFormatProperties *props = vkr_find_struct(
++         args->pImageFormatProperties->pNext, VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES);
++      if (props) {
++         props->externalMemoryProperties = (VkExternalMemoryProperties){
++            .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
++                                      VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
++            .exportFromImportedHandleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++            .compatibleHandleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++         };
++      }
++   }
++   vkr_relink(prev_ext, ext_info);
++   info->tiling = tiling;
++   vkr_relink(prev_mod, mod_info);
++#endif
+ }
+ 
+ static void
+@@ -796,6 +864,18 @@
+    vn_replace_vkGetPhysicalDeviceExternalBufferProperties_args_handle(args);
+    vk->GetPhysicalDeviceExternalBufferProperties(
+       args->physicalDevice, args->pExternalBufferInfo, args->pExternalBufferProperties);
++
++#if defined(__TERMUX__)
++   /* As for images: dma-buf memory is exported from an AHardwareBuffer. */
++   if (args->pExternalBufferInfo->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) {
++      args->pExternalBufferProperties->externalMemoryProperties = (VkExternalMemoryProperties){
++         .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
++                                   VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
++         .exportFromImportedHandleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++         .compatibleHandleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++      };
++   }
++#endif
+ }
+ 
+ static void

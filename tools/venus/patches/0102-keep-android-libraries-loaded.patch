@@ -1,0 +1,39 @@
+diff -ru a2/src/venus/vkr_device_memory.c b2/src/venus/vkr_device_memory.c
+--- a2/src/venus/vkr_device_memory.c	2026-10-13 11:43:51.351910316 -0400
++++ b2/src/venus/vkr_device_memory.c	2026-10-13 11:43:51.394328488 -0400
+@@ -274,7 +274,8 @@
+ 
+    if (bo->base)
+       bo->release(bo->base);
+-   dlclose(bo->handle);
++   /* libandroid stays loaded (see vkr_library_unload): it is opened per allocation, and the last
++    * dlclose unloaded it and its thread-exit destructors with it. */
+    free(gbm_bo);
+ }
+ #else
+@@ -301,7 +302,6 @@
+ #define LOAD_SYMBOL(func)                                                                \
+    if ((bo->func = (pfnAHardwareBuffer_##func)dlsym(                                     \
+            bo->handle, "AHardwareBuffer_" #func)) == NULL) {                             \
+-      dlclose(bo->handle);                                                               \
+       free(bo);                                                                          \
+       return VK_ERROR_INITIALIZATION_FAILED;                                             \
+    }
+diff -ru a2/src/venus/vkr_library.c b2/src/venus/vkr_library.c
+--- a2/src/venus/vkr_library.c	2026-10-13 11:43:51.350937413 -0400
++++ b2/src/venus/vkr_library.c	2026-10-13 11:43:51.392507769 -0400
+@@ -81,6 +81,14 @@
+ void
+ vkr_library_unload(struct vulkan_library *lib)
+ {
++#if defined(__TERMUX__)
++   /* Android's Vulkan stack registers thread-exit destructors (pthread keys) that outlive the
++    * context: unloaded, a worker thread exiting later jumped into unmapped code (SIGSEGV in
++    * pthread_key_clean_all, or "pthread_mutex_lock called on a destroyed mutex"). The loader
++    * stays for the life of the process, as it would in any Android app. */
++   (void)lib;
++   return;
++#endif
+    if (lib->handle) {
+       dlclose(lib->handle);
+       lib->GetInstanceProcAddr = NULL;

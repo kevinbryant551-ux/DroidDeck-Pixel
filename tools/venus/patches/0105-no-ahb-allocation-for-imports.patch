@@ -1,0 +1,20 @@
+diff -ru a5/src/venus/vkr_device_memory.c b5/src/venus/vkr_device_memory.c
+--- a5/src/venus/vkr_device_memory.c	2026-10-13 16:36:01.366706156 -0400
++++ b5/src/venus/vkr_device_memory.c	2026-10-13 16:36:01.412708244 -0400
+@@ -497,7 +497,15 @@
+    }
+ 
+ #if defined(__TERMUX__)
+-   if (export_info) {
++   /* An import (a resource the guest imported, VCMD_RESOURCE_IMPORT_FD) is already backed by its
++    * dma-buf: allocating an AHardwareBuffer for it as well put local_import_info into the chain a
++    * second time, made the chain a cycle, and the ring thread spun walking it forever. The driver
++    * cannot export dma-bufs either; a re-export uses the resource's own fd. */
++   if (export_info && res_info) {
++      VkBaseInStructure *prev_of_export_info =
++         vkr_find_prev_struct(alloc_info, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
++      prev_of_export_info->pNext = export_info->pNext;
++   } else if (export_info) {
+       VkBaseInStructure *prev_of_export_info =
+          vkr_find_prev_struct(alloc_info, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
+ 

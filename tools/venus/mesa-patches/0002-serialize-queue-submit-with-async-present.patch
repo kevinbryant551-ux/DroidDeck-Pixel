@@ -1,0 +1,187 @@
+diff -ru a/src/virtio/vulkan/vn_queue.c b/src/virtio/vulkan/vn_queue.c
+--- a/src/virtio/vulkan/vn_queue.c	2026-10-13 19:28:15.017438009 -0400
++++ b/src/virtio/vulkan/vn_queue.c	2026-10-13 19:28:15.019678380 -0400
+@@ -1270,16 +1270,15 @@
+    return queue->can_feedback;
+ }
+ 
+-VKAPI_ATTR VkResult VKAPI_CALL
+-vn_QueueSubmit(VkQueue queue,
+-               uint32_t submitCount,
+-               const VkSubmitInfo *pSubmits,
+-               VkFence fence)
++static VkResult
++vn_queue_submit_1(VkQueue queue,
++                  uint32_t submitCount,
++                  const VkSubmitInfo *pSubmits,
++                  VkFence fence)
+ {
+    VN_TRACE_FUNC();
+ 
+    vn_tls_set_async_pipeline_create();
+-   vn_wsi_flush(queue);
+ 
+    for (uint32_t i = 0; i < submitCount; i++) {
+       struct vn_queue_submission submit = {
+@@ -1468,16 +1467,15 @@
+    return vn_queue_submit(&submit);
+ }
+ 
+-VKAPI_ATTR VkResult VKAPI_CALL
+-vn_QueueSubmit2(VkQueue queue,
+-                uint32_t submitCount,
+-                const VkSubmitInfo2 *pSubmits,
+-                VkFence fence)
++static VkResult
++vn_queue_submit2_all(VkQueue queue,
++                     uint32_t submitCount,
++                     const VkSubmitInfo2 *pSubmits,
++                     VkFence fence)
+ {
+    VN_TRACE_FUNC();
+ 
+    vn_tls_set_async_pipeline_create();
+-   vn_wsi_flush(queue);
+ 
+    for (uint32_t i = 0; i < submitCount; i++) {
+       VkResult result = vn_queue_submit_2(
+@@ -1498,16 +1496,14 @@
+    return vn_wsi_fence_wait(queue);
+ }
+ 
+-VKAPI_ATTR VkResult VKAPI_CALL
+-vn_QueueBindSparse(VkQueue queue,
+-                   uint32_t bindInfoCount,
+-                   const VkBindSparseInfo *pBindInfo,
+-                   VkFence fence)
++static VkResult
++vn_queue_bind_sparse(VkQueue queue,
++                     uint32_t bindInfoCount,
++                     const VkBindSparseInfo *pBindInfo,
++                     VkFence fence)
+ {
+    VN_TRACE_FUNC();
+ 
+-   vn_wsi_flush(queue);
+-
+    for (uint32_t i = 0; i < bindInfoCount; i++) {
+       struct vn_queue_submission submit = {
+          .batch_type = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO,
+@@ -1532,6 +1528,46 @@
+ }
+ 
+ VKAPI_ATTR VkResult VKAPI_CALL
++vn_QueueSubmit(VkQueue queue,
++               uint32_t submitCount,
++               const VkSubmitInfo *pSubmits,
++               VkFence fence)
++{
++   const bool locked = vn_wsi_queue_lock(queue);
++   VkResult result = vn_queue_submit_1(queue, submitCount, pSubmits, fence);
++   if (locked)
++      vn_wsi_queue_unlock(queue);
++   return result;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL
++vn_QueueSubmit2(VkQueue queue,
++                uint32_t submitCount,
++                const VkSubmitInfo2 *pSubmits,
++                VkFence fence)
++{
++   const bool locked = vn_wsi_queue_lock(queue);
++   VkResult result = vn_queue_submit2_all(queue, submitCount, pSubmits, fence);
++   if (locked)
++      vn_wsi_queue_unlock(queue);
++   return result;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL
++vn_QueueBindSparse(VkQueue queue,
++                   uint32_t bindInfoCount,
++                   const VkBindSparseInfo *pBindInfo,
++                   VkFence fence)
++{
++   const bool locked = vn_wsi_queue_lock(queue);
++   VkResult result =
++      vn_queue_bind_sparse(queue, bindInfoCount, pBindInfo, fence);
++   if (locked)
++      vn_wsi_queue_unlock(queue);
++   return result;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL
+ vn_QueueWaitIdle(VkQueue _queue)
+ {
+    VN_TRACE_FUNC();
+diff -ru a/src/virtio/vulkan/vn_wsi.c b/src/virtio/vulkan/vn_wsi.c
+--- a/src/virtio/vulkan/vn_wsi.c	2026-10-13 19:28:15.017529848 -0400
++++ b/src/virtio/vulkan/vn_wsi.c	2026-10-13 19:28:15.019754225 -0400
+@@ -494,6 +494,32 @@
+    simple_mtx_unlock(&queue->async_present.queue_mutex);
+ }
+ 
++/* Holds the queue against the async present thread for a whole submission.
++ * vn_wsi_flush only waited for the present in flight: the thread could take
++ * the queue for the next present right after and submit concurrently, and
++ * both submissions built their batches in the queue's one cached storage
++ * (DXVK games crashed in vtest_vcmd_submit_cmd2 on a sync pointer of 1).
++ */
++bool
++vn_wsi_queue_lock(VkQueue queue_handle)
++{
++   struct vn_queue *queue = vn_queue_from_handle(queue_handle);
++
++   if (!queue->async_present.initialized ||
++       queue->async_present.tid == vn_gettid())
++      return false;
++
++   simple_mtx_lock(&queue->async_present.queue_mutex);
++   return true;
++}
++
++void
++vn_wsi_queue_unlock(VkQueue queue_handle)
++{
++   struct vn_queue *queue = vn_queue_from_handle(queue_handle);
++   simple_mtx_unlock(&queue->async_present.queue_mutex);
++}
++
+ static VkPresentInfoKHR *
+ vn_wsi_clone_present_info(struct vn_device *dev, const VkPresentInfoKHR *pi)
+ {
+diff -ru a/src/virtio/vulkan/vn_wsi.h b/src/virtio/vulkan/vn_wsi.h
+--- a/src/virtio/vulkan/vn_wsi.h	2026-10-13 19:28:15.017593192 -0400
++++ b/src/virtio/vulkan/vn_wsi.h	2026-10-13 19:28:15.019796687 -0400
+@@ -48,6 +48,12 @@
+ void
+ vn_wsi_flush(VkQueue queue_handle);
+ 
++bool
++vn_wsi_queue_lock(VkQueue queue_handle);
++
++void
++vn_wsi_queue_unlock(VkQueue queue_handle);
++
+ #else
+ 
+ static inline VkResult
+@@ -101,6 +107,18 @@
+ {
+    return;
+ }
++
++static inline bool
++vn_wsi_queue_lock(VkQueue queue_handle)
++{
++   return false;
++}
++
++static inline void
++vn_wsi_queue_unlock(VkQueue queue_handle)
++{
++   return;
++}
+ 
+ #endif /* VN_USE_WSI_PLATFORM */
+ 

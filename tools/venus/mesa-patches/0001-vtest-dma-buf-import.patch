@@ -1,0 +1,163 @@
+diff -ru a/src/virtio/vtest/vtest_protocol.h b/src/virtio/vtest/vtest_protocol.h
+--- a/src/virtio/vtest/vtest_protocol.h	2026-10-13 16:22:12.381551694 -0400
++++ b/src/virtio/vtest/vtest_protocol.h	2026-10-13 16:22:12.962933808 -0400
+@@ -27,7 +27,8 @@
+ 
+ #define VTEST_DEFAULT_SOCKET_NAME "/tmp/.virgl_test"
+ 
+-#define VTEST_PROTOCOL_VERSION 4
++/* 5: DroidDeck - VCMD_RESOURCE_IMPORT_FD */
++#define VTEST_PROTOCOL_VERSION 5
+ 
+ /* 32-bit length field */
+ /* 32-bit cmd field */
+@@ -94,6 +95,13 @@
+ #define VCMD_DRM_SYNC_TRANSFER 37
+ #define VCMD_RESOURCE_EXPORT_FD 38
+ 
++/* since protocol version 5 (DroidDeck): import a dma-buf the client holds as a resource of its
++ * context; the fd follows as SCM_RIGHTS, the reply carries the res_id */
++#define VCMD_RESOURCE_IMPORT_FD 39
++#define VCMD_RESOURCE_IMPORT_FD_SIZE 2
++#define VCMD_RESOURCE_IMPORT_FD_SIZE_LO 0
++#define VCMD_RESOURCE_IMPORT_FD_SIZE_HI 1
++
+ #define VCMD_RES_CREATE_SIZE 10
+ #define VCMD_RES_CREATE_RES_HANDLE 0 /* must be 0 since protocol version 3 */
+ #define VCMD_RES_CREATE_TARGET 1
+diff -ru a/src/virtio/vulkan/vn_renderer_vtest.c b/src/virtio/vulkan/vn_renderer_vtest.c
+--- a/src/virtio/vulkan/vn_renderer_vtest.c	2026-10-13 16:22:12.383213205 -0400
++++ b/src/virtio/vulkan/vn_renderer_vtest.c	2026-10-13 16:22:12.963927782 -0400
+@@ -149,6 +149,33 @@
+ }
+ 
+ static void
++vtest_send_fd(struct vtest *vtest, int fd)
++{
++   char cmsg_buf[CMSG_SPACE(sizeof(int))] = { 0 };
++   char dummy = 0;
++   struct msghdr msg = {
++      .msg_iov =
++         &(struct iovec){
++            .iov_base = &dummy,
++            .iov_len = sizeof(dummy),
++         },
++      .msg_iovlen = 1,
++      .msg_control = cmsg_buf,
++      .msg_controllen = sizeof(cmsg_buf),
++   };
++   struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
++   cmsg->cmsg_level = SOL_SOCKET;
++   cmsg->cmsg_type = SCM_RIGHTS;
++   cmsg->cmsg_len = CMSG_LEN(sizeof(int));
++   memcpy(CMSG_DATA(cmsg), &fd, sizeof(fd));
++
++   if (sendmsg(vtest->sock_fd, &msg, 0) < 0) {
++      vn_log(vtest->instance, "sendmsg failed: %s", strerror(errno));
++      abort();
++   }
++}
++
++static void
+ vtest_write(struct vtest *vtest, const void *buf, size_t size)
+ {
+    do {
+@@ -353,6 +380,30 @@
+    return res_id;
+ }
+ 
++static uint32_t
++vtest_vcmd_resource_import_fd(struct vtest *vtest, VkDeviceSize size, int fd)
++{
++   uint32_t vtest_hdr[VTEST_HDR_SIZE];
++   uint32_t vcmd_import[VCMD_RESOURCE_IMPORT_FD_SIZE];
++
++   vtest_hdr[VTEST_CMD_LEN] = VCMD_RESOURCE_IMPORT_FD_SIZE;
++   vtest_hdr[VTEST_CMD_ID] = VCMD_RESOURCE_IMPORT_FD;
++   vcmd_import[VCMD_RESOURCE_IMPORT_FD_SIZE_LO] = (uint32_t)size;
++   vcmd_import[VCMD_RESOURCE_IMPORT_FD_SIZE_HI] = (uint32_t)(size >> 32);
++
++   vtest_write(vtest, vtest_hdr, sizeof(vtest_hdr));
++   vtest_write(vtest, vcmd_import, sizeof(vcmd_import));
++   vtest_send_fd(vtest, fd);
++
++   vtest_read(vtest, vtest_hdr, sizeof(vtest_hdr));
++   assert(vtest_hdr[VTEST_CMD_LEN] == 1);
++   assert(vtest_hdr[VTEST_CMD_ID] == VCMD_RESOURCE_IMPORT_FD);
++
++   uint32_t res_id;
++   vtest_read(vtest, &res_id, sizeof(res_id));
++   return res_id;
++}
++
+ static void
+ vtest_vcmd_resource_unref(struct vtest *vtest, uint32_t res_id)
+ {
+@@ -742,6 +793,47 @@
+    return VK_SUCCESS;
+ }
+ 
++static VkResult
++vtest_bo_create_from_dma_buf(struct vn_renderer *renderer,
++                             VkDeviceSize size,
++                             int fd,
++                             VkMemoryPropertyFlags flags,
++                             struct vn_renderer_bo **out_bo)
++{
++   struct vtest *vtest = (struct vtest *)renderer;
++
++   /* The caller keeps fd; the bo keeps its own for mapping and re-export. */
++   const off_t fd_size = lseek(fd, 0, SEEK_END);
++   if (fd_size < 0 || (VkDeviceSize)fd_size < size)
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   const int res_fd = os_dupfd_cloexec(fd);
++   if (res_fd < 0)
++      return VK_ERROR_TOO_MANY_OBJECTS;
++
++   mtx_lock(&vtest->sock_mutex);
++   const uint32_t res_id =
++      vtest_vcmd_resource_import_fd(vtest, (VkDeviceSize)fd_size, fd);
++   mtx_unlock(&vtest->sock_mutex);
++   if (!res_id) {
++      close(res_fd);
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   }
++
++   struct vtest_bo *bo = util_sparse_array_get(&vtest->bo_array, res_id);
++   *bo = (struct vtest_bo){
++      .base = {
++         .refcount = VN_REFCOUNT_INIT(1),
++         .res_id = res_id,
++         .mmap_size = (size_t)fd_size,
++      },
++      .res_fd = res_fd,
++      .blob_flags = vtest_bo_blob_flags(flags, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT),
++   };
++
++   *out_bo = &bo->base;
++   return VK_SUCCESS;
++}
++
+ static void
+ vtest_shmem_destroy_now(struct vn_renderer *renderer,
+                         struct vn_renderer_shmem *_shmem)
+@@ -884,7 +976,8 @@
+    info->pci.vendor_id = VTEST_PCI_VENDOR_ID;
+    info->pci.device_id = VTEST_PCI_DEVICE_ID;
+ 
+-   info->has_dma_buf_import = false;
++   /* DroidDeck's vtest server (protocol 5) imports a dma-buf as a resource. */
++   info->has_dma_buf_import = vtest->protocol_version >= 5;
+    info->has_external_sync = false;
+    info->has_timeline_sync = !VN_PERF(NO_TIMELINE_SYNC);
+    info->has_implicit_fencing = false;
+@@ -1030,7 +1123,8 @@
+ 
+    vtest->base.bo_ops.create_from_device_memory =
+       vtest_bo_create_from_device_memory;
+-   vtest->base.bo_ops.create_from_dma_buf = NULL;
++   vtest->base.bo_ops.create_from_dma_buf =
++      vtest->protocol_version >= 5 ? vtest_bo_create_from_dma_buf : NULL;
+    vtest->base.bo_ops.destroy = vtest_bo_destroy;
+    vtest->base.bo_ops.export_dma_buf = vtest_bo_export_dma_buf;
+    vtest->base.bo_ops.export_sync_file =
