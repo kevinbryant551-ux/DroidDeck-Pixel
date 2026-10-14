@@ -1,0 +1,25 @@
+--- a/src/virtio/vulkan/vn_renderer_vtest.c	2026-10-14 16:40:20.947644495 -0400
++++ b/src/virtio/vulkan/vn_renderer_vtest.c	2026-10-14 16:40:20.934528302 -0400
+@@ -804,8 +804,21 @@
+ 
+    /* The caller keeps fd; the bo keeps its own for mapping and re-export. */
+    const off_t fd_size = lseek(fd, 0, SEEK_END);
+-   if (fd_size < 0 || (VkDeviceSize)fd_size < size)
++   /* An image's memory requirements can be a few pages larger than the buffer its exporter
++    * allocated for the same explicit layout (Chromium's overlay AHardwareBuffers: 3092480 bytes vs
++    * 3113024 asked). Accept that padding; the server imports the buffer at its real size. */
++   const VkDeviceSize padding_allowed = 64 * 1024;
++   if (fd_size < 0 || (VkDeviceSize)fd_size + padding_allowed < size) {
++      const int err = errno;
++      char path[64], target[128] = "?";
++      snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
++      const ssize_t n = readlink(path, target, sizeof(target) - 1);
++      if (n > 0)
++         target[n] = '\0';
++      fprintf(stderr, "venus: dma-buf import rejected: fd %d (%s) is %lld bytes (errno %d), %llu needed\n", fd,
++              target, (long long)fd_size, fd_size < 0 ? err : 0, (unsigned long long)size);
+       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   }
+    const int res_fd = os_dupfd_cloexec(fd);
+    if (res_fd < 0)
+       return VK_ERROR_TOO_MANY_OBJECTS;

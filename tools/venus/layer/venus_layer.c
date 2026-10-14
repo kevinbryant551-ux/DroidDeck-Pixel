@@ -38,6 +38,8 @@
 #include <vulkan/vk_layer.h>
 #include <vulkan/vulkan.h>
 
+#include "etc2_encode.h"
+
 #define BCDEC_IMPLEMENTATION
 #define BCDEC_BC4BC5_PRECISE
 #include "third_party/bcdec.h"
@@ -188,6 +190,15 @@ struct device_data {
    PFN_vkCmdSetPolygonModeEXT set_polygon_mode;
    PFN_vkCreateGraphicsPipelines create_graphics_pipelines;
    PFN_vkCreateShaderModule create_shader_module;
+   PFN_vkGetImageMemoryRequirements image_reqs;
+   PFN_vkGetImageMemoryRequirements2 image_reqs2;
+   PFN_vkGetDeviceImageMemoryRequirements device_image_reqs;
+   uint32_t host_visible_types; /* memory types the server backs with AHardwareBuffers */
+   /* DROIDDECK_VENUS_MEMORY_LOG=1: bytes allocated per memory type, and image placements */
+   bool memory_log;
+   struct map allocations; /* VkDeviceMemory -> size << 5 | memory type */
+   int64_t type_bytes[32];
+   uint32_t images_private, images_left;
    PFN_vkAllocateCommandBuffers allocate_command_buffers;
    PFN_vkFreeCommandBuffers free_command_buffers;
    PFN_vkResetCommandPool reset_command_pool;
@@ -198,6 +209,7 @@ struct device_data {
    PFN_vkQueueSubmit2 queue_submit2;
    /* handle -> state, under lock */
    struct map images;    /* VkImage -> (uintptr_t) original BC format */
+   struct map shared_images; /* VkImage -> 1: linear, external or DRM-modifier images */
    struct map buffers;   /* VkBuffer -> struct buffer_binding* */
    struct map mappings;  /* VkDeviceMemory -> struct mapping* (application's maps) */
    struct map cmd_pools; /* VkCommandBuffer -> VkCommandPool */
@@ -238,7 +250,13 @@ static bool env_off(const char *name)
 
 static bool is_bc(VkFormat f) { return f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_BC7_SRGB_BLOCK; }
 
-static VkFormat bc_substitute(VkFormat f)
+/* ETC2 / EAC hold the BC formats' data in the same bits per texel and Mali samples them natively;
+ * BC textures are transcoded to them unless the device lacks them (DROIDDECK_VENUS_NO_ETC2=1
+ * forces the uncompressed substitutes). Set with the first physical device's feature query. */
+static int etc2_enabled;
+
+/* The uncompressed substitute: what a decoded block's texels are stored as. */
+static VkFormat raw_substitute(VkFormat f)
 {
    switch (f) {
    case VK_FORMAT_BC1_RGB_UNORM_BLOCK: case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
@@ -257,6 +275,44 @@ static VkFormat bc_substitute(VkFormat f)
    }
 }
 
+/* The ETC2 / EAC substitute, or the uncompressed one where none fits (signed BC4/BC5, BC6H's
+ * HDR). Direct3D's BC1 always carries an alpha bit, so BC1 with alpha takes ETC2's RGBA8. */
+static VkFormat etc_substitute(VkFormat f)
+{
+   switch (f) {
+   case VK_FORMAT_BC1_RGB_UNORM_BLOCK: return VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK;
+   case VK_FORMAT_BC1_RGB_SRGB_BLOCK: return VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK;
+   case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: case VK_FORMAT_BC2_UNORM_BLOCK: case VK_FORMAT_BC3_UNORM_BLOCK:
+   case VK_FORMAT_BC7_UNORM_BLOCK:
+      return VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK;
+   case VK_FORMAT_BC1_RGBA_SRGB_BLOCK: case VK_FORMAT_BC2_SRGB_BLOCK: case VK_FORMAT_BC3_SRGB_BLOCK:
+   case VK_FORMAT_BC7_SRGB_BLOCK:
+      return VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK;
+   case VK_FORMAT_BC4_UNORM_BLOCK: return VK_FORMAT_EAC_R11_UNORM_BLOCK;
+   case VK_FORMAT_BC5_UNORM_BLOCK: return VK_FORMAT_EAC_R11G11_UNORM_BLOCK;
+   default: return raw_substitute(f);
+   }
+}
+
+static VkFormat bc_substitute(VkFormat f)
+{
+   return etc2_enabled ? etc_substitute(f) : raw_substitute(f);
+}
+
+/* Bytes per 4x4 block of an ETC2 / EAC substitute; 0 for an uncompressed one. */
+static uint32_t etc_block_bytes(VkFormat sub)
+{
+   switch (sub) {
+   case VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK: case VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK:
+   case VK_FORMAT_EAC_R11_UNORM_BLOCK:
+      return 8;
+   case VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK: case VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK:
+   case VK_FORMAT_EAC_R11G11_UNORM_BLOCK:
+      return 16;
+   default: return 0;
+   }
+}
+
 static uint32_t bc_block_bytes(VkFormat f)
 {
    switch (f) {
@@ -268,8 +324,12 @@ static uint32_t bc_block_bytes(VkFormat f)
    }
 }
 
-/* Images of the flagged formats keep a high bit set in dev->images: stored 16-bit. */
+/* How an image's BC format is stored, kept in high bits of its dev->images entry: the default
+ * substitute (bc_substitute), 16-bit (PACKED_BIT) or uncompressed (RAW_BIT: 3D images, which
+ * ETC2 cannot hold). */
 #define PACKED_BIT 0x80000000u
+#define RAW_BIT 0x40000000u
+#define KIND_BITS (PACKED_BIT | RAW_BIT)
 
 /* BC1 holds 565 endpoints, so a 16-bit substitute halves its memory for one bit of interpolation
  * precision. sRGB has no 16-bit format and stays RGBA8. */
@@ -282,9 +342,11 @@ static VkFormat packed_substitute(VkFormat f)
    }
 }
 
-static VkFormat image_substitute(VkFormat orig, bool packed)
+static VkFormat image_substitute(VkFormat orig, uint32_t kind)
 {
-   return packed ? packed_substitute(orig) : bc_substitute(orig);
+   if (kind & PACKED_BIT) return packed_substitute(orig);
+   if (kind & RAW_BIT) return raw_substitute(orig);
+   return bc_substitute(orig);
 }
 
 static uint32_t texel_bytes(VkFormat substitute)
@@ -350,12 +412,36 @@ static void decode_block_packed(VkFormat f, const uint8_t *src, uint8_t *dst, ui
    }
 }
 
+/* Transcodes one BC block into its ETC2 / EAC substitute's block. */
+static void transcode_block(VkFormat f, VkFormat sub, const uint8_t *src, uint8_t *dst)
+{
+   uint8_t px[4 * 4 * 4];
+   switch (f) {
+   case VK_FORMAT_BC4_UNORM_BLOCK:
+      bcdec_bc4(src, px, 4, 0);
+      eac_encode_r11(px, 1, dst);
+      return;
+   case VK_FORMAT_BC5_UNORM_BLOCK:
+      bcdec_bc5(src, px, 8, 0);
+      eac_encode_r11(px, 2, dst);
+      eac_encode_r11(px + 1, 2, dst + 8);
+      return;
+   default:
+      decode_block(f, src, px, 16);
+      if (sub == VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK || sub == VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK)
+         etc2_encode_rgb(px, dst);
+      else
+         etc2_encode_rgba(px, dst);
+      return;
+   }
+}
+
 /* ---- pending decodes: one per redirected upload, filled at submit ---- */
 
 struct decode {
    struct decode *next;
    VkFormat format;
-   bool packed;
+   uint32_t kind;
    VkBuffer src;
    VkDeviceSize src_offset;
    uint32_t row_blocks, height_blocks; /* the application's buffer layout */
@@ -363,14 +449,37 @@ struct decode {
    VkBuffer staging;
    VkDeviceMemory staging_memory;
    uint8_t *staging_ptr;
+   VkDeviceSize staging_size;
 };
+
+/* Bytes of decode staging alive across all devices; logged each time it crosses a 128 MiB step,
+ * with the high-water mark (DROIDDECK_VENUS_STAGING_LOG=1). */
+static int64_t staging_live, staging_peak;
+
+static void account_staging(int64_t delta)
+{
+   static int enabled = -1;
+   if (enabled < 0) enabled = env_off("DROIDDECK_VENUS_STAGING_LOG");
+   const int64_t before = __atomic_fetch_add(&staging_live, delta, __ATOMIC_RELAXED);
+   const int64_t after = before + delta;
+   int64_t peak = __atomic_load_n(&staging_peak, __ATOMIC_RELAXED);
+   while (after > peak && !__atomic_compare_exchange_n(&staging_peak, &peak, after, false,
+                                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+   const int64_t step = 128ll << 20;
+   if (enabled && before / step != after / step)
+      fprintf(stderr, LAYER_NAME ": decode staging %lld MiB (peak %lld MiB)\n",
+              (long long)(after >> 20), (long long)(__atomic_load_n(&staging_peak, __ATOMIC_RELAXED) >> 20));
+}
 
 static void free_decodes(struct device_data *dev, struct decode *d)
 {
    while (d) {
       struct decode *next = d->next;
       if (d->staging) dev->destroy_buffer(dev->device, d->staging, NULL);
-      if (d->staging_memory) dev->free_memory(dev->device, d->staging_memory, NULL);
+      if (d->staging_memory) {
+         dev->free_memory(dev->device, d->staging_memory, NULL);
+         account_staging(-(int64_t)d->staging_size);
+      }
       free(d);
       d = next;
    }
@@ -412,6 +521,8 @@ static bool create_staging(struct device_data *dev, VkDeviceSize size, struct de
       .memoryTypeIndex = type,
    };
    if (dev->allocate_memory(dev->device, &alloc, NULL, &d->staging_memory) != VK_SUCCESS) return false;
+   d->staging_size = reqs.size;
+   account_staging((int64_t)reqs.size);
    if (dev->bind_buffer_memory(dev->device, d->staging, d->staging_memory, 0) != VK_SUCCESS) return false;
    void *ptr;
    if (dev->map_memory(dev->device, d->staging_memory, 0, VK_WHOLE_SIZE, 0, &ptr) != VK_SUCCESS) return false;
@@ -419,27 +530,65 @@ static bool create_staging(struct device_data *dev, VkDeviceSize size, struct de
    return true;
 }
 
-/* The application's bytes for buffer `b`, if they are host-visible; *temp when we mapped them. */
-static const uint8_t *buffer_bytes(struct device_data *dev, VkBuffer b, VkDeviceMemory *temp)
+/* One decode's work at submit: its source bytes and the substitute it is written in. Rows of
+ * blocks are the unit handed to the decoding threads. */
+struct decode_job {
+   struct decode *d;
+   const uint8_t *src;
+   VkDeviceMemory temp; /* mapped here for the job, unmapped after */
+   VkDeviceMemory memory; /* the source's memory, and where it is mapped */
+   const uint8_t *base;
+   VkFormat sub;
+   uint32_t first_row, rows; /* in the submit's numbering of block rows */
+};
+
+struct decode_work {
+   struct decode_job *jobs;
+   uint32_t job_count, total_rows;
+   uint32_t next_row; /* atomic: the next row to take */
+};
+
+static void decode_row(const struct decode_job *job, uint32_t row)
 {
-   *temp = VK_NULL_HANDLE;
-   pthread_mutex_lock(&lock);
-   struct buffer_binding *bind = map_get(&dev->buffers, H(b));
-   struct mapping *m = bind ? map_get(&dev->mappings, H(bind->memory)) : NULL;
-   const uint8_t *base = m ? m->base : NULL;
-   VkDeviceMemory memory = bind ? bind->memory : VK_NULL_HANDLE;
-   VkDeviceSize offset = bind ? bind->offset : 0;
-   pthread_mutex_unlock(&lock);
-   if (!memory) return NULL;
-   if (!base) {
-      void *ptr;
-      if (dev->map_memory(dev->device, memory, 0, VK_WHOLE_SIZE, 0, &ptr) != VK_SUCCESS) return NULL;
-      *temp = memory;
-      base = ptr;
+   const struct decode *d = job->d;
+   const uint32_t s = row / d->blocks_h, by = row % d->blocks_h;
+   const uint32_t bb = bc_block_bytes(d->format);
+   const uint8_t *src = job->src + ((VkDeviceSize)s * d->height_blocks + by) * d->row_blocks * bb;
+   const uint32_t eb = etc_block_bytes(job->sub);
+   if (eb) {
+      uint8_t *dst = d->staging_ptr + ((VkDeviceSize)s * d->blocks_h + by) * d->blocks_w * eb;
+      for (uint32_t bx = 0; bx < d->blocks_w; bx++)
+         transcode_block(d->format, job->sub, src + (VkDeviceSize)bx * bb, dst + (VkDeviceSize)bx * eb);
+      return;
    }
-   return base + offset;
+   const uint32_t tb = texel_bytes(job->sub);
+   const uint32_t pitch = d->blocks_w * 4 * tb;
+   uint8_t *dst = d->staging_ptr + (VkDeviceSize)s * d->blocks_h * 4 * pitch + (VkDeviceSize)by * 4 * pitch;
+   for (uint32_t bx = 0; bx < d->blocks_w; bx++) {
+      if (d->kind & PACKED_BIT) decode_block_packed(d->format, src + (VkDeviceSize)bx * bb, dst + bx * 4 * tb, pitch);
+      else decode_block(d->format, src + (VkDeviceSize)bx * bb, dst + bx * 4 * tb, pitch);
+   }
 }
 
+static void *decode_worker(void *arg)
+{
+   struct decode_work *w = arg;
+   uint32_t job = 0;
+   for (;;) {
+      const uint32_t row = __atomic_fetch_add(&w->next_row, 4, __ATOMIC_RELAXED);
+      if (row >= w->total_rows) break;
+      const uint32_t end = row + 4 < w->total_rows ? row + 4 : w->total_rows;
+      for (uint32_t r = row; r < end; r++) {
+         while (r >= w->jobs[job].first_row + w->jobs[job].rows) job++;
+         while (r < w->jobs[job].first_row) job--;
+         decode_row(&w->jobs[job], r - w->jobs[job].first_row);
+      }
+   }
+   return NULL;
+}
+
+/* Fills the staging of every upload recorded in cb, on up to four threads: transcoding to ETC2
+ * costs about a microsecond a block, and a level's textures run to tens of millions of blocks. */
 static void run_decodes(struct device_data *dev, VkCommandBuffer cb)
 {
    /* DROIDDECK_VENUS_NO_BC_DECODE=1: textures stay undecoded (a diagnostic switch). */
@@ -449,33 +598,58 @@ static void run_decodes(struct device_data *dev, VkCommandBuffer cb)
    pthread_mutex_lock(&lock);
    struct decode *list = map_get(&dev->decodes, H(cb));
    pthread_mutex_unlock(&lock);
+   uint32_t count = 0;
+   for (struct decode *d = list; d; d = d->next) count++;
+   if (!count) return;
+   struct decode_job *jobs = calloc(count, sizeof(*jobs));
+   if (!jobs) return;
+   struct decode_work work = { .jobs = jobs };
    for (struct decode *d = list; d; d = d->next) {
-      VkDeviceMemory temp;
-      const uint8_t *src = buffer_bytes(dev, d->src, &temp);
+      struct decode_job *job = &jobs[work.job_count];
+      /* The source's bytes: a mapping the application holds, one an earlier job made, or a new
+       * one (memory cannot be mapped twice). */
+      pthread_mutex_lock(&lock);
+      struct buffer_binding *bind = map_get(&dev->buffers, H(d->src));
+      struct mapping *m = bind ? map_get(&dev->mappings, H(bind->memory)) : NULL;
+      job->memory = bind ? bind->memory : VK_NULL_HANDLE;
+      job->base = m ? m->base : NULL;
+      const VkDeviceSize offset = bind ? bind->offset : 0;
+      pthread_mutex_unlock(&lock);
+      for (uint32_t k = 0; k < work.job_count && job->memory && !job->base; k++)
+         if (jobs[k].memory == job->memory) job->base = jobs[k].base;
+      if (job->memory && !job->base) {
+         void *ptr;
+         if (dev->map_memory(dev->device, job->memory, 0, VK_WHOLE_SIZE, 0, &ptr) == VK_SUCCESS) {
+            job->temp = job->memory;
+            job->base = ptr;
+         }
+      }
+      const uint8_t *src = job->base ? job->base + offset : NULL;
       if (!src) {
          static bool warned;
          if (!warned) fprintf(stderr, LAYER_NAME ": BC upload from memory the host cannot read; left undecoded\n");
          warned = true;
          continue;
       }
-      src += d->src_offset;
-      const uint32_t bb = bc_block_bytes(d->format);
-      const uint32_t tb = texel_bytes(image_substitute(d->format, d->packed));
-      const uint32_t pitch = d->blocks_w * 4 * tb;
-      for (uint32_t s = 0; s < d->slices; s++) {
-         const uint8_t *slice_src = src + (VkDeviceSize)s * d->height_blocks * d->row_blocks * bb;
-         uint8_t *slice_dst = d->staging_ptr + (VkDeviceSize)s * d->blocks_h * 4 * pitch;
-         for (uint32_t by = 0; by < d->blocks_h; by++)
-            for (uint32_t bx = 0; bx < d->blocks_w; bx++)
-            {
-               const uint8_t *block = slice_src + ((VkDeviceSize)by * d->row_blocks + bx) * bb;
-               uint8_t *out = slice_dst + (VkDeviceSize)by * 4 * pitch + bx * 4 * tb;
-               if (d->packed) decode_block_packed(d->format, block, out, pitch);
-               else decode_block(d->format, block, out, pitch);
-            }
-      }
-      if (temp) dev->unmap_memory(dev->device, temp);
+      job->d = d;
+      job->src = src + d->src_offset;
+      job->sub = image_substitute(d->format, d->kind);
+      job->first_row = work.total_rows;
+      job->rows = d->slices * d->blocks_h;
+      work.total_rows += job->rows;
+      work.job_count++;
    }
+   pthread_t threads[3];
+   int started = 0;
+   const uint64_t blocks = (uint64_t)work.total_rows * (list ? list->blocks_w : 0);
+   if (work.total_rows >= 64 && blocks >= 16384)
+      for (; started < 3; started++)
+         if (pthread_create(&threads[started], NULL, decode_worker, &work)) break;
+   decode_worker(&work);
+   for (int t = 0; t < started; t++) pthread_join(threads[t], NULL);
+   for (uint32_t k = 0; k < work.job_count; k++)
+      if (jobs[k].temp) dev->unmap_memory(dev->device, jobs[k].temp);
+   free(jobs);
 }
 
 /* ---- DROIDDECK_VENUS_SEGV_TRACE=1: a backtrace for a fault, then the handler that was there ---- */
@@ -591,6 +765,7 @@ static uint32_t driver_missing(struct instance_data *in, VkPhysicalDevice pd)
    const VkPhysicalDeviceFeatures *f = &f2.features;
    uint32_t missing = 0;
    if (!f->textureCompressionBC) missing |= FAKE_BC;
+   if (f->textureCompressionETC2 && !env_off("DROIDDECK_VENUS_NO_ETC2")) etc2_enabled = 1;
    if (!f->fillModeNonSolid) missing |= FAKE_FILL_MODE;
    if (!f->multiViewport) missing |= FAKE_MULTI_VIEWPORT;
    if (!f->shaderClipDistance) missing |= FAKE_CLIP_DISTANCE;
@@ -693,7 +868,7 @@ layer_GetPhysicalDeviceImageFormatProperties(VkPhysicalDevice pd, VkFormat forma
    if (!in) return VK_ERROR_INITIALIZATION_FAILED;
    if (is_bc(format) && (driver_missing(in, pd) & FAKE_BC)) {
       if (tiling != VK_IMAGE_TILING_OPTIMAL) return VK_ERROR_FORMAT_NOT_SUPPORTED;
-      format = bc_substitute(format);
+      format = image_substitute(format, etc2_enabled && type == VK_IMAGE_TYPE_3D ? RAW_BIT : 0);
       flags &= ~VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
    }
    return in->image_format_props(pd, format, type, tiling, usage, flags, p);
@@ -709,7 +884,7 @@ layer_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice pd, const VkPhysi
       return in->image_format_props2(pd, info, p);
    if (info->tiling != VK_IMAGE_TILING_OPTIMAL) return VK_ERROR_FORMAT_NOT_SUPPORTED;
    VkPhysicalDeviceImageFormatInfo2 copy = *info;
-   copy.format = bc_substitute(info->format);
+   copy.format = image_substitute(info->format, etc2_enabled && info->type == VK_IMAGE_TYPE_3D ? RAW_BIT : 0);
    copy.flags &= ~VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
    /* A format list naming BC formats would not match the substitute. */
    VkBaseOutStructure *prev = (VkBaseOutStructure *)&copy, *list = NULL;
@@ -890,7 +1065,7 @@ layer_CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo *info, const Vk
    dev->next_gdpa = gdpa;
    if (in->memory_props) in->memory_props(pd, &dev->memory);
    /* DROIDDECK_VENUS_BC_FULL=1 keeps BC1 at 32 bits a texel. */
-   if ((fake & FAKE_BC) && !env_off("DROIDDECK_VENUS_BC_FULL") && in->format_props) {
+   if ((fake & FAKE_BC) && !etc2_enabled && !env_off("DROIDDECK_VENUS_BC_FULL") && in->format_props) {
       const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
                                         VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
                                         VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
@@ -931,6 +1106,15 @@ layer_CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo *info, const Vk
    GET(set_polygon_mode, "vkCmdSetPolygonModeEXT");
    GET(create_graphics_pipelines, "vkCreateGraphicsPipelines");
    GET(create_shader_module, "vkCreateShaderModule");
+   GET(image_reqs, "vkGetImageMemoryRequirements");
+   GET(image_reqs2, "vkGetImageMemoryRequirements2");
+   GET(device_image_reqs, "vkGetDeviceImageMemoryRequirements");
+   if (!dev->image_reqs2) dev->image_reqs2 = (void *)gdpa(*out, "vkGetImageMemoryRequirements2KHR");
+   if (!dev->device_image_reqs) dev->device_image_reqs = (void *)gdpa(*out, "vkGetDeviceImageMemoryRequirementsKHR");
+   for (uint32_t i = 0; i < dev->memory.memoryTypeCount; i++)
+      if (dev->memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+         dev->host_visible_types |= 1u << i;
+   dev->memory_log = env_off("DROIDDECK_VENUS_MEMORY_LOG");
    GET(allocate_command_buffers, "vkAllocateCommandBuffers");
    GET(free_command_buffers, "vkFreeCommandBuffers");
    GET(reset_command_pool, "vkResetCommandPool");
@@ -1024,6 +1208,120 @@ layer_ImportSemaphoreFdKHR(VkDevice device, const VkImportSemaphoreFdInfoKHR *in
    return VK_ERROR_INVALID_EXTERNAL_HANDLE;
 }
 
+/* ---- image placement ---- */
+
+/* The server creates an image linear only when another process may see it (0108); every other
+ * image keeps its tiling, Mali's own for render targets and textures. Host-visible memory is an
+ * AHardwareBuffer blob there, laid out for linear images only, so those images are kept to the
+ * memory types that are not host-visible. */
+/* DROIDDECK_VENUS_LINEAR=1: every image linear, as before 0108. */
+static bool all_linear(void)
+{
+   static int value = -1;
+   if (value < 0) value = env_off("DROIDDECK_VENUS_LINEAR");
+   return value;
+}
+
+static bool is_shared_image(const VkImageCreateInfo *info)
+{
+   if (all_linear() || info->tiling != VK_IMAGE_TILING_OPTIMAL) return true;
+   for (const VkBaseInStructure *s = info->pNext; s; s = s->pNext)
+      if (s->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO ||
+          s->sType == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT ||
+          s->sType == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT)
+         return true;
+   return false;
+}
+
+static void keep_private(struct device_data *dev, uint32_t *bits)
+{
+   const uint32_t private_bits = *bits & ~dev->host_visible_types;
+   if (private_bits) *bits = private_bits;
+   if (dev->memory_log) __atomic_fetch_add(private_bits ? &dev->images_private : &dev->images_left, 1, __ATOMIC_RELAXED);
+}
+
+static void account_memory(struct device_data *dev, uint32_t type, int64_t delta)
+{
+   if (type >= 32) return;
+   const int64_t before = __atomic_fetch_add(&dev->type_bytes[type], delta, __ATOMIC_RELAXED);
+   const int64_t after = before + delta, step = 128ll << 20;
+   if (before / step != after / step)
+      fprintf(stderr, LAYER_NAME ": memory type %u (%s): %lld MiB; image requirements steered %u, left %u\n",
+              type, dev->host_visible_types & (1u << type) ? "host-visible" : "device-only", (long long)(after >> 20),
+              __atomic_load_n(&dev->images_private, __ATOMIC_RELAXED), __atomic_load_n(&dev->images_left, __ATOMIC_RELAXED));
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+layer_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *info, const VkAllocationCallbacks *alloc,
+                     VkDeviceMemory *out)
+{
+   struct device_data *dev = find_device(key_of(device));
+   if (!dev) return VK_ERROR_INITIALIZATION_FAILED;
+   VkResult r = dev->allocate_memory(device, info, alloc, out);
+   if (r != VK_SUCCESS) {
+      /* Failures are rare and fatal for most clients (Chromium drops its GPU process), so always say what was asked. */
+      char chain[256] = "";
+      size_t n = 0;
+      for (const VkBaseInStructure *s = info->pNext; s && n < sizeof(chain) - 16; s = s->pNext)
+         n += snprintf(chain + n, sizeof(chain) - n, " %d", (int)s->sType);
+      fprintf(stderr, LAYER_NAME ": vkAllocateMemory failed (%d): %llu bytes, type %u (%s), pNext sTypes:%s\n", (int)r,
+              (unsigned long long)info->allocationSize, info->memoryTypeIndex,
+              dev->host_visible_types & (1u << info->memoryTypeIndex) ? "host-visible" : "device-only", chain);
+      for (const VkBaseInStructure *s = info->pNext; s; s = s->pNext)
+         if (s->sType == VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO)
+            fprintf(stderr, LAYER_NAME ":   export handle types 0x%x\n",
+                    (unsigned)((const VkExportMemoryAllocateInfo *)s)->handleTypes);
+         else if (s->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO)
+            fprintf(stderr, LAYER_NAME ":   dedicated image %p buffer %p\n",
+                    (void *)((const VkMemoryDedicatedAllocateInfo *)s)->image,
+                    (void *)((const VkMemoryDedicatedAllocateInfo *)s)->buffer);
+   }
+   if (r == VK_SUCCESS && dev->memory_log) {
+      pthread_mutex_lock(&lock);
+      map_put(&dev->allocations, H(*out), (void *)(uintptr_t)(info->allocationSize << 5 | info->memoryTypeIndex));
+      pthread_mutex_unlock(&lock);
+      account_memory(dev, info->memoryTypeIndex, (int64_t)info->allocationSize);
+   }
+   return r;
+}
+
+static bool image_is_shared(struct device_data *dev, VkImage image)
+{
+   pthread_mutex_lock(&lock);
+   const bool shared = map_get(&dev->shared_images, H(image)) != NULL;
+   pthread_mutex_unlock(&lock);
+   return shared;
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+layer_GetImageMemoryRequirements(VkDevice device, VkImage image, VkMemoryRequirements *reqs)
+{
+   struct device_data *dev = find_device(key_of(device));
+   if (!dev) return;
+   dev->image_reqs(device, image, reqs);
+   if (!image_is_shared(dev, image)) keep_private(dev, &reqs->memoryTypeBits);
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+layer_GetImageMemoryRequirements2(VkDevice device, const VkImageMemoryRequirementsInfo2 *info,
+                                  VkMemoryRequirements2 *reqs)
+{
+   struct device_data *dev = find_device(key_of(device));
+   if (!dev) return;
+   dev->image_reqs2(device, info, reqs);
+   if (!image_is_shared(dev, info->image)) keep_private(dev, &reqs->memoryRequirements.memoryTypeBits);
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+layer_GetDeviceImageMemoryRequirements(VkDevice device, const VkDeviceImageMemoryRequirements *info,
+                                       VkMemoryRequirements2 *reqs)
+{
+   struct device_data *dev = find_device(key_of(device));
+   if (!dev) return;
+   dev->device_image_reqs(device, info, reqs);
+   if (!is_shared_image(info->pCreateInfo)) keep_private(dev, &reqs->memoryRequirements.memoryTypeBits);
+}
+
 /* ---- swapchains ---- */
 
 static VKAPI_ATTR VkResult VKAPI_CALL
@@ -1039,19 +1337,42 @@ layer_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *info,
 
 /* ---- BC images ---- */
 
+static VkResult create_image_bc(struct device_data *dev, VkDevice device, const VkImageCreateInfo *info,
+                                const VkAllocationCallbacks *alloc, VkImage *out);
+
 static VKAPI_ATTR VkResult VKAPI_CALL
 layer_CreateImage(VkDevice device, const VkImageCreateInfo *info, const VkAllocationCallbacks *alloc, VkImage *out)
 {
    struct device_data *dev = find_device(key_of(device));
    if (!dev) return VK_ERROR_INITIALIZATION_FAILED;
+   VkImageCreateInfo linear;
+   if (all_linear() && info->tiling == VK_IMAGE_TILING_OPTIMAL) {
+      linear = *info;
+      linear.tiling = VK_IMAGE_TILING_LINEAR;
+      info = &linear;
+   }
+   VkResult result = create_image_bc(dev, device, info, alloc, out);
+   if (result == VK_SUCCESS && is_shared_image(info)) {
+      pthread_mutex_lock(&lock);
+      map_put(&dev->shared_images, H(*out), (void *)1);
+      pthread_mutex_unlock(&lock);
+   }
+   return result;
+}
+
+static VkResult
+create_image_bc(struct device_data *dev, VkDevice device, const VkImageCreateInfo *info,
+                const VkAllocationCallbacks *alloc, VkImage *out)
+{
    if (!(dev->fake & FAKE_BC) || !is_bc(info->format)) return dev->create_image(device, info, alloc, out);
 
    VkImageCreateInfo copy = *info;
-   copy.format = bc_substitute(info->format);
+   const uint32_t raw = etc2_enabled && info->imageType == VK_IMAGE_TYPE_3D ? RAW_BIT : 0;
+   copy.format = image_substitute(info->format, raw);
    copy.flags &= ~VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
-   copy.tiling = VK_IMAGE_TILING_OPTIMAL;
+   copy.tiling = all_linear() ? VK_IMAGE_TILING_LINEAR : VK_IMAGE_TILING_OPTIMAL;
    /* Packed only when no view can ask for another format (an sRGB view, say). */
-   bool packed = dev->pack_bc1 && packed_substitute(info->format);
+   bool packed = dev->pack_bc1 && !raw && packed_substitute(info->format);
    /* A view-format list: BC formats become the substitute, others (block-sized views for copies)
     * have no texel equivalent and are dropped. */
    VkImageFormatListCreateInfo *list = NULL;
@@ -1066,7 +1387,7 @@ layer_CreateImage(VkDevice device, const VkImageCreateInfo *info, const VkAlloca
       for (uint32_t i = 0; i < list->viewFormatCount && n < ARRAY_LEN(formats); i++) {
          VkFormat f = list->pViewFormats[i];
          if (!is_bc(f)) continue;
-         f = bc_substitute(f);
+         f = image_substitute(f, raw);
          bool seen = false;
          for (uint32_t j = 0; j < n; j++) seen |= formats[j] == f;
          if (!seen) formats[n++] = f;
@@ -1088,7 +1409,7 @@ layer_CreateImage(VkDevice device, const VkImageCreateInfo *info, const VkAlloca
    }
    if (result == VK_SUCCESS) {
       pthread_mutex_lock(&lock);
-      map_put(&dev->images, H(*out), (void *)(uintptr_t)(info->format | (packed ? PACKED_BIT : 0)));
+      map_put(&dev->images, H(*out), (void *)(uintptr_t)(info->format | (packed ? PACKED_BIT : 0) | raw));
       pthread_mutex_unlock(&lock);
    }
    return result;
@@ -1102,18 +1423,19 @@ layer_DestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks *
    if (image) {
       pthread_mutex_lock(&lock);
       map_take(&dev->images, H(image));
+      map_take(&dev->shared_images, H(image));
       pthread_mutex_unlock(&lock);
    }
    dev->destroy_image(device, image, alloc);
 }
 
-static VkFormat substituted_format(struct device_data *dev, VkImage image, bool *packed)
+static VkFormat substituted_format(struct device_data *dev, VkImage image, uint32_t *kind)
 {
    pthread_mutex_lock(&lock);
    uintptr_t f = (uintptr_t)map_get(&dev->images, H(image));
    pthread_mutex_unlock(&lock);
-   if (packed) *packed = f & PACKED_BIT;
-   return (VkFormat)(f & ~(uintptr_t)PACKED_BIT);
+   if (kind) *kind = (uint32_t)(f & KIND_BITS);
+   return (VkFormat)(f & ~(uintptr_t)KIND_BITS);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL
@@ -1121,12 +1443,12 @@ layer_CreateImageView(VkDevice device, const VkImageViewCreateInfo *info, const 
 {
    struct device_data *dev = find_device(key_of(device));
    if (!dev) return VK_ERROR_INITIALIZATION_FAILED;
-   bool packed;
-   const VkFormat orig = substituted_format(dev, info->image, &packed);
+   uint32_t kind;
+   const VkFormat orig = substituted_format(dev, info->image, &kind);
    if (!orig) return dev->create_image_view(device, info, alloc, out);
    VkImageViewCreateInfo copy = *info;
-   copy.format = packed ? packed_substitute(orig)
-                        : is_bc(info->format) ? bc_substitute(info->format) : bc_substitute(orig);
+   copy.format = (kind & PACKED_BIT) ? packed_substitute(orig)
+                                     : image_substitute(is_bc(info->format) ? info->format : orig, kind);
    return dev->create_image_view(device, &copy, alloc, out);
 }
 
@@ -1241,20 +1563,26 @@ layer_FreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallb
    struct device_data *dev = find_device(key_of(device));
    if (!dev) return;
    if (memory) untrack_map(dev, memory);
+   if (memory && dev->memory_log) {
+      pthread_mutex_lock(&lock);
+      const uintptr_t v = (uintptr_t)map_take(&dev->allocations, H(memory));
+      pthread_mutex_unlock(&lock);
+      if (v) account_memory(dev, (uint32_t)(v & 31), -(int64_t)(v >> 5));
+   }
    dev->free_memory(device, memory, alloc);
 }
 
 /* ---- uploads into BC images ---- */
 
 /* Plans one region's decode; returns false (region skipped) when it cannot. */
-static bool plan_region(struct device_data *dev, VkCommandBuffer cb, VkFormat format, bool packed, VkBuffer src,
+static bool plan_region(struct device_data *dev, VkCommandBuffer cb, VkFormat format, uint32_t kind, VkBuffer src,
                         VkDeviceSize offset, uint32_t row_length, uint32_t image_height,
                         VkExtent3D extent, uint32_t layers, VkBuffer *staging_out)
 {
    struct decode *d = calloc(1, sizeof(*d));
    if (!d) return false;
    d->format = format;
-   d->packed = packed;
+   d->kind = kind;
    d->src = src;
    d->src_offset = offset;
    d->blocks_w = (extent.width + 3) / 4;
@@ -1262,8 +1590,10 @@ static bool plan_region(struct device_data *dev, VkCommandBuffer cb, VkFormat fo
    d->row_blocks = row_length ? (row_length + 3) / 4 : d->blocks_w;
    d->height_blocks = image_height ? (image_height + 3) / 4 : d->blocks_h;
    d->slices = (extent.depth ? extent.depth : 1) * (layers ? layers : 1);
-   const VkDeviceSize size = (VkDeviceSize)d->blocks_w * 4 * d->blocks_h * 4 *
-                             texel_bytes(image_substitute(format, packed)) * d->slices;
+   const VkFormat sub = image_substitute(format, kind);
+   const VkDeviceSize size = etc_block_bytes(sub)
+      ? (VkDeviceSize)d->blocks_w * d->blocks_h * etc_block_bytes(sub) * d->slices
+      : (VkDeviceSize)d->blocks_w * 4 * d->blocks_h * 4 * texel_bytes(sub) * d->slices;
    if (!create_staging(dev, size, d)) {
       free_decodes(dev, d);
       return false;
@@ -1282,8 +1612,8 @@ layer_CmdCopyBufferToImage(VkCommandBuffer cb, VkBuffer src, VkImage dst, VkImag
 {
    struct device_data *dev = find_device(key_of(cb));
    if (!dev) return;
-   bool packed;
-   const VkFormat orig = substituted_format(dev, dst, &packed);
+   uint32_t kind;
+   const VkFormat orig = substituted_format(dev, dst, &kind);
    if (!orig) {
       dev->copy_buffer_to_image(cb, src, dst, layout, count, regions);
       return;
@@ -1291,7 +1621,7 @@ layer_CmdCopyBufferToImage(VkCommandBuffer cb, VkBuffer src, VkImage dst, VkImag
    for (uint32_t i = 0; i < count; i++) {
       const VkBufferImageCopy *r = &regions[i];
       VkBuffer staging;
-      if (!plan_region(dev, cb, orig, packed, src, r->bufferOffset, r->bufferRowLength, r->bufferImageHeight,
+      if (!plan_region(dev, cb, orig, kind, src, r->bufferOffset, r->bufferRowLength, r->bufferImageHeight,
                        r->imageExtent, r->imageSubresource.layerCount, &staging))
          continue;
       VkBufferImageCopy c = *r;
@@ -1307,8 +1637,8 @@ layer_CmdCopyBufferToImage2(VkCommandBuffer cb, const VkCopyBufferToImageInfo2 *
 {
    struct device_data *dev = find_device(key_of(cb));
    if (!dev) return;
-   bool packed;
-   const VkFormat orig = substituted_format(dev, info->dstImage, &packed);
+   uint32_t kind;
+   const VkFormat orig = substituted_format(dev, info->dstImage, &kind);
    if (!orig) {
       dev->copy_buffer_to_image2(cb, info);
       return;
@@ -1316,7 +1646,7 @@ layer_CmdCopyBufferToImage2(VkCommandBuffer cb, const VkCopyBufferToImageInfo2 *
    for (uint32_t i = 0; i < info->regionCount; i++) {
       const VkBufferImageCopy2 *r = &info->pRegions[i];
       VkBuffer staging;
-      if (!plan_region(dev, cb, orig, packed, info->srcBuffer, r->bufferOffset, r->bufferRowLength,
+      if (!plan_region(dev, cb, orig, kind, info->srcBuffer, r->bufferOffset, r->bufferRowLength,
                        r->bufferImageHeight, r->imageExtent, r->imageSubresource.layerCount, &staging))
          continue;
       VkBufferImageCopy2 c = *r;
@@ -1773,8 +2103,13 @@ static const struct entry device_entries[] = {
    { "vkGetSemaphoreFdKHR", (PFN_vkVoidFunction)layer_GetSemaphoreFdKHR, SEM },
    { "vkImportSemaphoreFdKHR", (PFN_vkVoidFunction)layer_ImportSemaphoreFdKHR, SEM },
    { "vkCreateSwapchainKHR", (PFN_vkVoidFunction)layer_CreateSwapchainKHR, 0 },
-   { "vkCreateImage", (PFN_vkVoidFunction)layer_CreateImage, FAKE_BC },
-   { "vkDestroyImage", (PFN_vkVoidFunction)layer_DestroyImage, FAKE_BC },
+   { "vkCreateImage", (PFN_vkVoidFunction)layer_CreateImage, 0 },
+   { "vkDestroyImage", (PFN_vkVoidFunction)layer_DestroyImage, 0 },
+   { "vkGetImageMemoryRequirements", (PFN_vkVoidFunction)layer_GetImageMemoryRequirements, 0 },
+   { "vkGetImageMemoryRequirements2", (PFN_vkVoidFunction)layer_GetImageMemoryRequirements2, 0 },
+   { "vkGetImageMemoryRequirements2KHR", (PFN_vkVoidFunction)layer_GetImageMemoryRequirements2, 0 },
+   { "vkGetDeviceImageMemoryRequirements", (PFN_vkVoidFunction)layer_GetDeviceImageMemoryRequirements, 0 },
+   { "vkGetDeviceImageMemoryRequirementsKHR", (PFN_vkVoidFunction)layer_GetDeviceImageMemoryRequirements, 0 },
    { "vkCreateImageView", (PFN_vkVoidFunction)layer_CreateImageView, FAKE_BC },
    { "vkBindBufferMemory", (PFN_vkVoidFunction)layer_BindBufferMemory, FAKE_BC },
    { "vkBindBufferMemory2", (PFN_vkVoidFunction)layer_BindBufferMemory2, FAKE_BC },
@@ -1786,7 +2121,8 @@ static const struct entry device_entries[] = {
    { "vkUnmapMemory", (PFN_vkVoidFunction)layer_UnmapMemory, FAKE_BC },
    { "vkUnmapMemory2", (PFN_vkVoidFunction)layer_UnmapMemory2, FAKE_BC },
    { "vkUnmapMemory2KHR", (PFN_vkVoidFunction)layer_UnmapMemory2, FAKE_BC },
-   { "vkFreeMemory", (PFN_vkVoidFunction)layer_FreeMemory, FAKE_BC },
+   { "vkAllocateMemory", (PFN_vkVoidFunction)layer_AllocateMemory, 0 },
+   { "vkFreeMemory", (PFN_vkVoidFunction)layer_FreeMemory, 0 },
    { "vkCmdCopyBufferToImage", (PFN_vkVoidFunction)layer_CmdCopyBufferToImage, FAKE_BC },
    { "vkCmdCopyBufferToImage2", (PFN_vkVoidFunction)layer_CmdCopyBufferToImage2, FAKE_BC },
    { "vkCmdCopyBufferToImage2KHR", (PFN_vkVoidFunction)layer_CmdCopyBufferToImage2, FAKE_BC },

@@ -1,0 +1,18 @@
+--- a/src/venus/vkr_device_memory.c	2026-10-14 16:40:13.368447756 -0400
++++ b/src/venus/vkr_device_memory.c	2026-10-14 16:40:13.369578390 -0400
+@@ -387,6 +387,15 @@
+       }
+ 
+       prev_of_res_info->pNext = (const struct VkBaseInStructure *)&local_import_info;
++
++      /* A dma-buf exported elsewhere (an AHardwareBuffer) holds the image at the exporter's explicit
++       * layout, but the importer's image requirements can carry a few pages of padding beyond it
++       * (Chromium's overlay buffers: 3092480 bytes vs 3113024 asked). The driver rejects an import
++       * larger than the buffer, so import exactly what is there. */
++      struct vkr_resource *res = vkr_context_get_resource(ctx, res_info->resourceId);
++      if (res && res->fd_type == VIRGL_RESOURCE_FD_DMABUF && res->size &&
++          alloc_info->allocationSize > res->size)
++         alloc_info->allocationSize = res->size;
+    }
+ 
+    VkExportMemoryAllocateInfo *export_info =

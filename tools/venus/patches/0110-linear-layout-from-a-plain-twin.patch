@@ -1,0 +1,147 @@
+--- a/src/venus/vkr_image.c	2026-10-14 17:32:10.239476956 -0400
++++ b/src/venus/vkr_image.c	2026-10-14 17:32:10.240673396 -0400
+@@ -8,6 +8,90 @@
+ #include "vkr_image_gen.h"
+ #include "vkr_physical_device.h"
+ 
++#if defined(__TERMUX__)
++#include <pthread.h>
++
++/* What each recent image was created as, for the zero-row-pitch log (a ring; diagnostics only). */
++static struct {
++   VkImage image;
++   VkFormat format;
++   VkExtent3D extent;
++   VkImageTiling tiling, asked_tiling;
++   VkImageUsageFlags usage;
++   VkImageCreateFlags flags;
++   bool external, modifier;
++} image_log[512];
++static unsigned image_log_next;
++static pthread_mutex_t image_log_lock = PTHREAD_MUTEX_INITIALIZER;
++
++/* Mali answers a row pitch of 0 for some linear images (mutable-format colour attachments that
++ * stand in for DRM-modifier images), and a compositor then gets stride 0 or reads garbage. A
++ * linear layout depends only on format and extent, so ask a plain twin image instead. */
++static bool
++probe_linear_layout(struct vn_device_proc_table *vk, VkDevice device, VkImage image,
++                    VkSubresourceLayout *layout)
++{
++   VkFormat format = VK_FORMAT_UNDEFINED;
++   VkExtent3D extent = { 0 };
++   pthread_mutex_lock(&image_log_lock);
++   for (unsigned i = 0; i < sizeof(image_log) / sizeof(image_log[0]); i++) {
++      if (image_log[i].image == image && image_log[i].tiling == VK_IMAGE_TILING_LINEAR) {
++         format = image_log[i].format;
++         extent = image_log[i].extent;
++         break;
++      }
++   }
++   pthread_mutex_unlock(&image_log_lock);
++   if (format == VK_FORMAT_UNDEFINED)
++      return false;
++
++   const VkImageCreateInfo info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++      .imageType = VK_IMAGE_TYPE_2D,
++      .format = format,
++      .extent = extent,
++      .mipLevels = 1,
++      .arrayLayers = 1,
++      .samples = VK_SAMPLE_COUNT_1_BIT,
++      .tiling = VK_IMAGE_TILING_LINEAR,
++      .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
++               VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++   };
++   VkImage twin;
++   if (vk->CreateImage(device, &info, NULL, &twin) != VK_SUCCESS)
++      return false;
++   const VkImageSubresource sub = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT };
++   VkSubresourceLayout twin_layout = { 0 };
++   vk->GetImageSubresourceLayout(device, twin, &sub, &twin_layout);
++   vk->DestroyImage(device, twin, NULL);
++   if (!twin_layout.rowPitch)
++      return false;
++   *layout = twin_layout;
++   return true;
++}
++
++static void
++log_image_info(VkImage image, const char *what)
++{
++   pthread_mutex_lock(&image_log_lock);
++   for (unsigned i = 0; i < sizeof(image_log) / sizeof(image_log[0]); i++) {
++      if (image_log[i].image == image) {
++         vkr_log("  %s: format %d %ux%u tiling %d (asked %d) usage 0x%x flags 0x%x%s%s", what,
++                 image_log[i].format, image_log[i].extent.width, image_log[i].extent.height,
++                 image_log[i].tiling, image_log[i].asked_tiling, image_log[i].usage,
++                 image_log[i].flags, image_log[i].external ? " external" : "",
++                 image_log[i].modifier ? " modifier" : "");
++         pthread_mutex_unlock(&image_log_lock);
++         return;
++      }
++   }
++   pthread_mutex_unlock(&image_log_lock);
++   vkr_log("  %s: not in the recent-image log", what);
++}
++#endif
++
+ static void
+ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
+                            struct vn_command_vkCreateImage *args)
+@@ -58,11 +142,28 @@
+     * AHardwareBuffer. The guest (VK_LAYER_DROIDDECK_venus) keeps every other image out of
+     * host-visible memory, which is where AHardwareBuffers come from, so those keep the tiling
+     * they asked for - Mali's own, for render targets and textures. */
++   const VkImageTiling asked_tiling = image_info->tiling;
+    if (handle_info || modifier)
+       image_info->tiling = VK_IMAGE_TILING_LINEAR;
+-#endif
+ 
++   struct vkr_image *image = vkr_image_create_and_add(dispatch->data, args);
++   if (image) {
++      pthread_mutex_lock(&image_log_lock);
++      const unsigned i = image_log_next++ % (sizeof(image_log) / sizeof(image_log[0]));
++      image_log[i].image = image->base.handle.image;
++      image_log[i].format = image_info->format;
++      image_log[i].extent = image_info->extent;
++      image_log[i].tiling = image_info->tiling;
++      image_log[i].asked_tiling = asked_tiling;
++      image_log[i].usage = image_info->usage;
++      image_log[i].flags = image_info->flags;
++      image_log[i].external = handle_info != NULL;
++      image_log[i].modifier = modifier;
++      pthread_mutex_unlock(&image_log_lock);
++   }
++#else
+    vkr_image_create_and_add(dispatch->data, args);
++#endif
+ }
+ 
+ static void
+@@ -179,8 +280,21 @@
+       }
+       vk->GetImageSubresourceLayout(args->device, args->image, sub, args->pLayout);
+       if (!args->pLayout->rowPitch)
+-         vkr_log("vkGetImageSubresourceLayout: row pitch 0 for memory plane (aspect 0x%x -> 0x%x)",
+-                 aspect, sub->aspectMask);
++      {
++         static int probe_logs;
++         if (aspect & VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT &&
++             probe_linear_layout(vk, args->device, args->image, args->pLayout)) {
++            if (probe_logs++ < 8)
++               vkr_log("vkGetImageSubresourceLayout: row pitch 0 for memory plane; plain twin says "
++                       "row pitch %llu size %llu",
++                       (unsigned long long)args->pLayout->rowPitch,
++                       (unsigned long long)args->pLayout->size);
++         } else {
++            vkr_log("vkGetImageSubresourceLayout: row pitch 0 for memory plane (aspect 0x%x -> 0x%x)",
++                    aspect, sub->aspectMask);
++            log_image_info(args->image, "image");
++         }
++      }
+       sub->aspectMask = aspect;
+       return;
+    }

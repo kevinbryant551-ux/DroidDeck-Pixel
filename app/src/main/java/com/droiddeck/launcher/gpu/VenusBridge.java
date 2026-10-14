@@ -215,10 +215,10 @@ public final class VenusBridge extends SessionPart {
         }
     }
 
-    @Override
-    public int suspendPid() {
-        return pid;
-    }
+    // Not frozen with the session (SessionPart.suspendPid's default). Venus clients watch the
+    // server's ring-alive status and abort after ~3 s without it; a game thawed a moment before
+    // the server read the frozen server as dead and exited when the phone was unlocked. The server
+    // idles while its clients are stopped.
 
     /** Every descendant of {@code root}, from /proc: the app may read its own processes' stat. */
     private static List<Integer> childrenOf(int root) {

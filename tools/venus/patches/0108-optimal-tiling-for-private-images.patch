@@ -1,0 +1,31 @@
+diff -ru a/src/venus/vkr_image.c b/src/venus/vkr_image.c
+--- a/src/venus/vkr_image.c	2026-10-13 19:49:23.885729894 -0400
++++ b/src/venus/vkr_image.c	2026-10-13 19:49:23.901048270 -0400
+@@ -40,19 +40,26 @@
+       prev_of_handle_info->pNext = handle_info->pNext;
+    }
+    VkImageCreateInfo *image_info = (void *)args->pCreateInfo;
+-   image_info->tiling = VK_IMAGE_TILING_LINEAR;
+    /* Linear is the one modifier advertised; its create structs would not be valid with it. */
+    const VkStructureType mod_structs[] = {
+       VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
+       VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
+    };
++   bool modifier = image_info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+    for (unsigned i = 0; i < sizeof(mod_structs) / sizeof(mod_structs[0]); i++) {
+       const VkBaseInStructure *mod = vkr_find_struct(image_info->pNext, mod_structs[i]);
+       if (mod) {
+          VkBaseInStructure *prev = vkr_find_prev_struct(image_info, mod_structs[i]);
+          prev->pNext = mod->pNext;
++         modifier = true;
+       }
+    }
++   /* Only an image another process may see needs a layout both sides agree on: linear, in an
++    * AHardwareBuffer. The guest (VK_LAYER_DROIDDECK_venus) keeps every other image out of
++    * host-visible memory, which is where AHardwareBuffers come from, so those keep the tiling
++    * they asked for - Mali's own, for render targets and textures. */
++   if (handle_info || modifier)
++      image_info->tiling = VK_IMAGE_TILING_LINEAR;
+ #endif
+ 
+    vkr_image_create_and_add(dispatch->data, args);

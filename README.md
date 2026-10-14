@@ -30,8 +30,9 @@ Tested on a **Pixel 10a** (Tensor G4, Mali-G715 GPU, Android 17).
 |---|---|
 | Steam client (Big Picture) | Works. Sign-in, store, library and downloads all work, at about 50–60 fps in menus. |
 | Patapon 1+2 Replay (DirectX 11) | Playable. About 55 fps in levels, with sound and controller input. |
-| Dark Souls Remastered (DirectX 11) | Playable but slow. About 10–28 fps depending on the area, with the FEX preset set to **Extreme + TSO** (see [tips](#tips-for-playable-performance)). |
+| Dark Souls Remastered (DirectX 11) | Playable. About 30 fps in most areas with the FEX preset set to **Extreme + TSO** (see [tips](#tips-for-playable-performance)). GPU memory use dropped from 3.1 to 1.4 GB in 0.4.0-pixel.2. |
 | Steam overlay during a game | Opens, but can stall for a few seconds when the phone is low on memory. |
+| Quick Access menu (the **…** button) | Doesn't appear. The screen dims, but the menu stays invisible and takes the input, so Steam looks frozen. Press **B** to close it. Before 0.4.0-pixel.2 this crashed and restarted Steam's interface (see [known issues](#known-issues)). |
 
 Other Mali phones (Pixel 6–9, many Samsung and MediaTek devices) should take the same path, but nobody has tested them. Reports are welcome in the [issues](../../issues).
 
@@ -52,7 +53,8 @@ Everything else works as it does in upstream DroidDeck; its original README is k
 ## Tips for playable performance
 
 - **Pick a faster FEX preset per game.** FEX translates the game's x86 code to ARM, and most Windows games are limited by it. In the game's DroidDeck settings, set **FEX preset** to **Extreme + TSO**. That took Dark Souls Remastered from about 12 fps to the high 20s. If a game crashes with it, go back to the default.
-- **Lower the in-game graphics.** Turn antialiasing, ambient occlusion, depth of field and motion blur off, and set texture quality to medium. Textures take 2–4 times more memory on these GPUs (see [known issues](#known-issues)).
+- **Lower the in-game graphics.** Turn antialiasing, ambient occlusion, depth of field and motion blur off, and set texture quality to medium. Most compressed textures now stay compressed on the GPU, but a few formats still take 2–4 times more memory (see [known issues](#known-issues)).
+- **Close other apps first.** On an 8 GB phone, Steam's interface competes with everything else for memory, and Android swapping it in and out makes the UI lag.
 - **Don't charge while you play.** Charging and gaming together pushed a Pixel 10a into Android's "severe" thermal state, which cuts CPU and GPU clocks.
 
 ## Known issues
@@ -60,17 +62,22 @@ Everything else works as it does in upstream DroidDeck; its original README is k
 **Performance**
 - Every GPU call is relayed through a separate process (see [how it works](#how-this-fork-makes-it-run)), which adds CPU overhead and latency compared to native Turnip on Adreno.
 - Heavy scenes in 3D games run in the teens or low 20s. Combat can feel delayed, because several frames are queued between your input and the screen.
-- Every GPU image is stored in a linear layout, which wastes memory bandwidth on Mali's tile-based GPU. An experiment that gave game-only images Mali's tiled layout crashed Dark Souls Remastered on loading, so it isn't in this build.
-- Entering a new area can cause a short hitch. Shaders are compiled at that moment, and compressed textures are decoded on the CPU (see the next section).
+- Images another process may see (window buffers) are stored in a linear layout. Since 0.4.0-pixel.2, every other image uses Mali's own tiled layout.
+- Entering a new area can cause a short hitch. Shaders are compiled at that moment, and compressed textures are converted on the CPU (see the next section).
 
 **Graphics**
-- Mali GPUs can't read the compressed texture formats PC games ship with (BC1–BC7). This build decodes them on the CPU when they're loaded, which takes 2–8 times more GPU memory and some CPU time. Plain colour textures are stored at 16 bits to halve that cost.
+- Mali GPUs can't read the compressed texture formats PC games ship with (BC1–BC7). Since 0.4.0-pixel.2, BC1, BC2, BC3 and BC7 are converted to ETC2, and unsigned BC4 and BC5 to EAC, on up to four CPU threads as they're uploaded, so they stay compressed on the GPU. Signed BC4/BC5 and BC6H (HDR) textures are still decoded to uncompressed formats, which take 2–8 times more memory. ETC2 is a little lower quality than BC7.
 - Mali has no clip or cull distances. Shaders that use them are rewritten so the GPU driver doesn't crash, but the clipping is ignored, so some geometry the game meant to hide may show.
 - Mali also lacks wireframe drawing (`fillModeNonSolid`) and multiple viewports. Wireframe draws come out filled, and only the first viewport is used.
 - Mali's shader compiler can still crash on some shaders this build doesn't rewrite yet. One was seen from a short-lived helper process at game launch. When the GPU server crashes, the game it serves freezes or exits.
 
 **Memory**
 - Opening the Steam overlay inside a game can push an 8 GB phone close to out-of-memory. Steam's UI then stalls for a few seconds until memory frees up.
+- Steam's interface is laggy when the phone is short on memory. With other apps open, Android keeps swapping Steam's web UI out and back in.
+
+**Steam's Quick Access menu**
+- The **…** button opens the menu invisibly. Steam draws it in a child window on top of its main window. Gamescope's Vulkan WSI layer then stops presenting either window directly and falls back to presenting through Xwayland, and that path doesn't work under Venus yet. Press **B** to close the menu.
+- Before 0.4.0-pixel.2, opening the menu also crashed Steam's GPU process, and after three crashes Steam restarted its whole interface. That's fixed: importing the menu's window buffer failed over a few kilobytes of padding (virglrenderer `0109`, Mesa `0003`).
 
 **Display**
 - Wine's hidden background window sends the compositor an invalid frame ("invalid stride 0" in the logs). It's harmless for the game, but that hidden window's connection gets dropped.
@@ -156,27 +163,37 @@ Compared with upstream DroidDeck (`main` as of October 2026):
     - `0105`: fixes an infinite loop when importing those buffers.
     - `0106`: extra diagnostics.
     - `0107`: extra diagnostics.
+    - `0108`: lets images no other process sees keep Mali's tiled layout. Only window buffers stay linear.
+    - `0109`: imports a shared window buffer at its real size, when the importing image asks for a few pages more.
+    - `0110`: answers a linear image's row layout from a plain twin image when Mali reports a row pitch of 0.
 - **Mesa patches.**
   - `0001`: the guest side of the buffer import.
   - `0002`: fixes a race in Venus where its present thread and the game's thread built GPU submissions in the same scratch buffer. It crashed games at random in `vkQueueSubmit2`.
+  - `0003`: accepts a shared buffer up to 64 KB smaller than the importing image asks for (padding), and logs the reason when an import is refused.
 - **`layer/venus_layer.c`, the Vulkan layer.**
   - Gives gamescope a render node.
   - Stands in for two things Mali lacks for gamescope and DXVK:
     - the semaphore file-descriptor extension;
     - the features DXVK requires: BC texture compression, wireframe, multiple viewports, clip and cull distances, and `robustBufferAccess2`.
-  - Decodes BC textures on the CPU (with `bcdec`). Plain colour (BC1) textures are stored at 16 bits.
+  - Converts BC textures to ETC2/EAC on the CPU, on up to four threads (`etc2_encode.h`). Formats ETC2 can't hold are decoded with `bcdec`.
+  - Steers images that no other process sees into device-only memory, so they keep Mali's tiled layout.
+  - Logs every failed memory allocation with what was asked for.
   - Rewrites shaders that use clip or cull distances, so Mali's compiler doesn't crash on them.
   - Has an optional crash tracer.
 
 ## Troubleshooting switches
 
-Put `KEY=VALUE` lines in `Download/droiddeck-env` on the phone. They apply from the next session.
+Put `KEY=VALUE` lines in `Android/data/com.droiddeck.launcher/files/droiddeck-env` on the phone, from adb or a file manager that can reach the app's folder. They apply from the next session. (The old `Download/droiddeck-env` location is ignored.)
 
 | Line | Effect |
 |---|---|
 | `DROIDDECK_VENUS_SEGV_TRACE=1` | Prints a backtrace for crashes and aborts in the game's log. |
 | `DROIDDECK_VENUS_BC_FULL=1` | Stores BC1 textures at 32 bits instead of 16, if textures look wrong. |
 | `DROIDDECK_VENUS_NO_FAKE=1` | Stops the layer standing in for missing features. DXVK games won't start, but it helps tell a layer bug from a game bug. |
+| `DROIDDECK_VENUS_NO_ETC2=1` | Decodes BC textures to uncompressed formats instead of converting them to ETC2/EAC, if textures look wrong. Uses much more memory. |
+| `DROIDDECK_VENUS_LINEAR=1` | Stores every image in a linear layout, as before 0.4.0-pixel.2. |
+| `DROIDDECK_VENUS_MEMORY_LOG=1` | Logs GPU memory per memory type, every 128 MB. |
+| `DROIDDECK_VENUS_STAGING_LOG=1` | Logs the memory used to stage texture conversions. |
 | `DROIDDECK_VENUS_NO_BC_DECODE=1` | Skips texture decoding (textures will be blank). Diagnostic only. |
 | `PROTON_LOG=1` | Proton's full log, in `steam-<appid>.log`. It slows games down a lot. |
 
