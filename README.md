@@ -30,6 +30,7 @@ Tested on a **Pixel 10a** (Tensor G4, Mali-G715 GPU, Android 17).
 |---|---|
 | Steam client (Big Picture) | Works. Sign-in, store, library and downloads all work, at about 50–60 fps in menus. |
 | Patapon 1+2 Replay (DirectX 11) | Playable. About 55 fps in levels, with sound and controller input. |
+| Phoenix Wright: Ace Attorney Trilogy | Playable. 60 fps in menus and story scenes, with sound and controller or keyboard input. |
 | Dark Souls Remastered (DirectX 11) | Playable. About 30 fps in most areas with the FEX preset set to **Extreme + TSO** (see [tips](#tips-for-playable-performance)). GPU memory use dropped from 3.1 to 1.4 GB in 0.4.0-pixel.2. |
 | Steam overlay during a game | Opens, but can stall for a few seconds when the phone is low on memory. |
 | Quick Access menu (the **…** button) | Doesn't appear. The screen dims, but the menu stays invisible and takes the input, so Steam looks frozen. Press **B** to close it. Before 0.4.0-pixel.2 this crashed and restarted Steam's interface (see [known issues](#known-issues)). |
@@ -37,8 +38,14 @@ Tested on a **Pixel 10a** (Tensor G4, Mali-G715 GPU, Android 17).
 Other Mali phones (Pixel 6–9, many Samsung and MediaTek devices) should take the same path, but nobody has tested them. Reports are welcome in the [issues](../../issues).
 
 <p align="center">
-  <img src="docs/pixel/patapon-boot.jpg" width="60%" alt="Patapon 1+2 Replay booting to the Bandai Namco logo through Proton on a Pixel">
+  <img src="docs/pixel/dark-souls-ingame.jpg" width="49%" alt="Dark Souls Remastered in game on a Pixel 10a, the knight standing in the Undead Asylum">
+  <img src="docs/pixel/ace-attorney-office.jpg" width="49%" alt="Phoenix Wright: Ace Attorney Trilogy, a story scene in the law office on a Pixel 10a">
 </p>
+<p align="center">
+  <img src="docs/pixel/ace-attorney-title.jpg" width="49%" alt="Phoenix Wright: Ace Attorney Trilogy title menu on a Pixel 10a">
+  <img src="docs/pixel/patapon-boot.jpg" width="49%" alt="Patapon 1+2 Replay booting to the Bandai Namco logo through Proton on a Pixel">
+</p>
+<p align="center"><sub>Screenshots taken with gamescope on a Pixel 10a running 0.4.0-pixel.2.</sub></p>
 
 ## Install the test build
 
@@ -165,7 +172,6 @@ Compared with upstream DroidDeck (`main` as of October 2026):
     - `0107`: extra diagnostics.
     - `0108`: lets images no other process sees keep Mali's tiled layout. Only window buffers stay linear.
     - `0109`: imports a shared window buffer at its real size, when the importing image asks for a few pages more.
-    - `0110`: answers a linear image's row layout from a plain twin image when Mali reports a row pitch of 0.
 - **Mesa patches.**
   - `0001`: the guest side of the buffer import.
   - `0002`: fixes a race in Venus where its present thread and the game's thread built GPU submissions in the same scratch buffer. It crashed games at random in `vkQueueSubmit2`.
