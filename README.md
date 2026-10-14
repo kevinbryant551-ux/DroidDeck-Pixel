@@ -42,7 +42,7 @@ Other Mali phones (Pixel 6–9, many Samsung and MediaTek devices) should take t
 ## Install the test build
 
 1. **Uninstall official DroidDeck first** if you have it. This build is signed with a different key, so Android won't install it over the official app. Uninstalling deletes the downloaded runtime and Steam data, so you'll download them again.
-2. Download `DroidDeck-Pixel-*.apk` from [Releases](../../releases) and install it. Android may warn that the app isn't 16 KB page-size compatible. Tap **OK**; it still runs (see [known issues](#known-issues)).
+2. Download `DroidDeck-Pixel-*.apk` from [Releases](../../releases) and install it. It's signed with the public Android test key, so only install builds from this repo's Releases page. Android may warn that the app isn't 16 KB page-size compatible. Tap **OK**; it still runs (see [known issues](#known-issues)).
 3. Allow file access when asked.
 4. Turn off **Restrict child processes** in Developer options, as for upstream DroidDeck.
 5. Install the Linux runtime from the app, press **Play Steam**, and sign in.
